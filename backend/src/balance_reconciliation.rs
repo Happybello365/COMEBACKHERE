@@ -38,6 +38,9 @@ pub enum ReconciliationError {
 
     #[error("max retries exceeded")]
     MaxRetriesExceeded,
+
+    #[error("amount overflow: {0}")]
+    AmountOverflow(String),
 }
 
 /// Reconciliation status tracking.
@@ -215,10 +218,7 @@ impl BalanceReconciliation {
         }
 
         let id = uuid::Uuid::new_v4().to_string();
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = Self::current_timestamp();
 
         let report = ReconciliationReport {
             id: id.clone(),
@@ -235,14 +235,42 @@ impl BalanceReconciliation {
             error: None,
         };
 
-        let mut reports = self
-            .reports
-            .lock()
-            .map_err(|_| ReconciliationError::Internal("lock poisoned".to_string()))?;
+        let mut reports = match self.reports.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                // Release the running flag so a poisoned lock does not deadlock
+                // future reconciliation attempts.
+                self.running
+                    .store(false, std::sync::atomic::Ordering::SeqCst);
+                return Err(ReconciliationError::Internal("lock poisoned".to_string()));
+            }
+        };
 
         reports.insert(id.clone(), report);
 
         Ok(id)
+    }
+
+    /// Obtain the current UNIX timestamp in seconds, defaulting to 0 if the
+    /// system clock is before the epoch (avoids panics under unusual clocks).
+    fn current_timestamp() -> u64 {
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0)
+    }
+
+    /// Compute the signed difference between indexed and ledger amounts using
+    /// checked arithmetic to avoid overflow on extreme values.
+    fn checked_difference(indexed_amount: u64, ledger_amount: u64) -> Result<i64, ReconciliationError> {
+        let diff = (indexed_amount as i128) - (ledger_amount as i128);
+        if diff > i64::MAX as i128 || diff < i64::MIN as i128 {
+            return Err(ReconciliationError::AmountOverflow(format!(
+                "difference between {} and {} exceeds i64 range",
+                indexed_amount, ledger_amount
+            )));
+        }
+        Ok(diff as i64)
     }
 
     /// Add a detected discrepancy to the report.
@@ -258,6 +286,10 @@ impl BalanceReconciliation {
         Self::validate_invoice_id(&invoice_id)?;
         Self::validate_merchant_id(&merchant_id)?;
 
+        // Compute the difference before acquiring the lock so overflow errors
+        // do not leave the report in a partially updated state.
+        let difference = Self::checked_difference(indexed_amount, ledger_amount)?;
+
         let mut reports = self
             .reports
             .lock()
@@ -272,11 +304,7 @@ impl BalanceReconciliation {
             return Ok(()); // Silently ignore to prevent report explosion
         }
 
-        let difference = indexed_amount as i64 - ledger_amount as i64;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
+        let now = Self::current_timestamp();
 
         let discrepancy = Discrepancy {
             invoice_id,
@@ -289,7 +317,7 @@ impl BalanceReconciliation {
 
         if difference != 0 {
             report.in_sync = false;
-            report.discrepancy_count += 1;
+            report.discrepancy_count = report.discrepancy_count.saturating_add(1);
         }
 
         report.discrepancies.push(discrepancy);
@@ -309,12 +337,7 @@ impl BalanceReconciliation {
             .ok_or_else(|| ReconciliationError::NotFound(report_id.to_string()))?;
 
         report.status = ReconciliationStatus::Completed;
-        report.completed_at = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        );
+        report.completed_at = Some(Self::current_timestamp());
 
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -339,12 +362,7 @@ impl BalanceReconciliation {
 
         report.status = ReconciliationStatus::Failed;
         report.error = Some(error);
-        report.completed_at = Some(
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-        );
+        report.completed_at = Some(Self::current_timestamp());
 
         self.running
             .store(false, std::sync::atomic::Ordering::SeqCst);
@@ -551,5 +569,103 @@ mod tests {
 
         let balance = reconciliation.get_indexed_balance("unknown").unwrap();
         assert_eq!(balance, None);
+    }
+
+    #[test]
+    fn test_checked_difference_normal() {
+        assert_eq!(
+            BalanceReconciliation::checked_difference(1000, 900).unwrap(),
+            100
+        );
+        assert_eq!(
+            BalanceReconciliation::checked_difference(900, 1000).unwrap(),
+            -100
+        );
+        assert_eq!(
+            BalanceReconciliation::checked_difference(0, 0).unwrap(),
+            0
+        );
+    }
+
+    #[test]
+    fn test_checked_difference_extremes() {
+        // u64::MAX - 0 does not fit in i64 and must be rejected.
+        assert!(matches!(
+            BalanceReconciliation::checked_difference(u64::MAX, 0),
+            Err(ReconciliationError::AmountOverflow(_))
+        ));
+        // 0 - u64::MAX does not fit in i64 either.
+        assert!(matches!(
+            BalanceReconciliation::checked_difference(0, u64::MAX),
+            Err(ReconciliationError::AmountOverflow(_))
+        ));
+        // i64::MAX is representable.
+        assert_eq!(
+            BalanceReconciliation::checked_difference(i64::MAX as u64, 0).unwrap(),
+            i64::MAX
+        );
+    }
+
+    #[test]
+    fn test_add_discrepancy_overflow_rejected() {
+        let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+
+        let report_id = reconciliation
+            .start_reconciliation("valid-api-key-123", 12345)
+            .unwrap();
+
+        let result = reconciliation.add_discrepancy(
+            &report_id,
+            "invoice-123".to_string(),
+            "merchant-456".to_string(),
+            u64::MAX,
+            0,
+        );
+        assert!(matches!(result, Err(ReconciliationError::AmountOverflow(_))));
+
+        // Report must remain untouched after the failed call.
+        let report = reconciliation.get_report(&report_id).unwrap();
+        assert_eq!(report.discrepancy_count, 0);
+        assert!(report.in_sync);
+        assert!(report.discrepancies.is_empty());
+    }
+
+    #[test]
+    fn test_add_discrepancy_after_completion() {
+        let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+
+        let report_id = reconciliation
+            .start_reconciliation("valid-api-key-123", 12345)
+            .unwrap();
+        reconciliation.complete_reconciliation(&report_id).unwrap();
+
+        // A new run can be started once the previous one completed.
+        assert!(reconciliation
+            .start_reconciliation("valid-api-key-123", 12346)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_fail_releases_running_flag() {
+        let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+
+        let report_id = reconciliation
+            .start_reconciliation("valid-api-key-123", 12345)
+            .unwrap();
+        reconciliation
+            .fail_reconciliation(&report_id, "boom".to_string())
+            .unwrap();
+
+        // After a failure, a fresh reconciliation must be allowed.
+        assert!(reconciliation
+            .start_reconciliation("valid-api-key-123", 12346)
+            .is_ok());
+    }
+
+    #[test]
+    fn test_complete_unknown_report() {
+        let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+        let result = reconciliation.complete_reconciliation("missing");
+        assert!(matches!(result, Err(ReconciliationError::NotFound(_))));
     }
 }

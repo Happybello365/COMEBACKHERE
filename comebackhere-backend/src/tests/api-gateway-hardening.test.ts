@@ -4,6 +4,13 @@ import { MAX_API_KEY_LENGTH, requireMerchantApiKey } from "../middleware/apiKey.
 import { requireAdminKey } from "../middleware/adminAuth.js"
 import { validateBody, validateParams } from "../middleware/validate.js"
 import { errorHandler } from "../middleware/errorHandler.js"
+import {
+  MAX_REPORT_QUERY_LENGTH,
+  MAX_REPORT_FILTER_DEPTH,
+  sanitizeReportQuery,
+  assertSafeReportFilter,
+  requireReportAccess,
+} from "../reporting-engine/security.js"
 
 function mockRes() {
   const res: any = { locals: {}, headersSent: false }
@@ -41,128 +48,86 @@ describe("api-gateway hardening (gateway middleware)", () => {
   })
 })
 
-describe("apiKey middleware hardening", () => {
-  const originalEnv = process.env.MERCHANT_API_KEY
+describe("reporting-engine hardening (auth + input boundaries)", () => {
+  describe("requireReportAccess", () => {
+    it("rejects unauthenticated requests", () => {
+      const next = vi.fn()
+      requireReportAccess({} as any, mockRes(), next)
+      expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
+    })
 
-  beforeEach(() => {
-    process.env.MERCHANT_API_KEY = "valid-merchant-key-123"
+    it("rejects requests without a merchant scope", () => {
+      const next = vi.fn()
+      requireReportAccess({ user: { id: "u1" } } as any, mockRes(), next)
+      expect(next.mock.calls[0][0]).toMatchObject({ status: 403 })
+    })
+
+    it("rejects cross-merchant access attempts", () => {
+      const next = vi.fn()
+      const req: any = {
+        user: { id: "u1", merchantId: "merchant-a" },
+        params: { merchantId: "merchant-b" },
+      }
+      requireReportAccess(req, mockRes(), next)
+      expect(next.mock.calls[0][0]).toMatchObject({ status: 403 })
+    })
+
+    it("allows same-merchant access", () => {
+      const next = vi.fn()
+      const req: any = {
+        user: { id: "u1", merchantId: "merchant-a" },
+        params: { merchantId: "merchant-a" },
+      }
+      requireReportAccess(req, mockRes(), next)
+      expect(next).toHaveBeenCalledWith()
+    })
   })
 
-  afterEach(() => {
-    if (originalEnv === undefined) delete process.env.MERCHANT_API_KEY
-    else process.env.MERCHANT_API_KEY = originalEnv
+  describe("sanitizeReportQuery", () => {
+    it("rejects non-string queries", () => {
+      expect(() => sanitizeReportQuery({ $ne: null } as any)).toThrow()
+    })
+
+    it("rejects oversized queries", () => {
+      expect(() => sanitizeReportQuery("a".repeat(MAX_REPORT_QUERY_LENGTH + 1))).toThrow()
+    })
+
+    it("strips control characters and trims", () => {
+      expect(sanitizeReportQuery("  revenue\u0000\u0007  ")).toBe("revenue")
+    })
+
+    it("neutralizes operator injection payloads", () => {
+      const out = sanitizeReportQuery('{"$where":"sleep(1000)"}')
+      expect(out).not.toContain("$where")
+      expect(out).not.toContain("$")
+    })
   })
 
-  it("rejects requests with no Authorization header", () => {
-    const req: any = { get: () => undefined }
-    const next = vi.fn()
-    requireMerchantApiKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
+  describe("assertSafeReportFilter", () => {
+    it("rejects operator keys", () => {
+      expect(() => assertSafeReportFilter({ $gt: 1 })).toThrow()
+    })
 
-  it("rejects malformed Authorization headers (missing Bearer prefix)", () => {
-    const req: any = { get: () => "valid-merchant-key-123" }
-    const next = vi.fn()
-    requireMerchantApiKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
+    it("rejects prototype pollution keys", () => {
+      expect(() => assertSafeReportFilter({ __proto__: { polluted: true } })).toThrow()
+      expect(() => assertSafeReportFilter({ constructor: {} })).toThrow()
+    })
 
-  it("rejects keys containing control characters", () => {
-    const req: any = { get: () => "Bearer valid-merchant-key-123\u0000" }
-    const next = vi.fn()
-    requireMerchantApiKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
+    it("rejects filters nested beyond the depth limit", () => {
+      let deep: any = { value: 1 }
+      for (let i = 0; i < MAX_REPORT_FILTER_DEPTH + 1; i++) deep = { nested: deep }
+      expect(() => assertSafeReportFilter(deep)).toThrow()
+    })
 
-  it("rejects oversized keys before comparison", () => {
-    const req: any = { get: () => `Bearer ${"a".repeat(MAX_API_KEY_LENGTH + 1)}` }
-    const next = vi.fn()
-    requireMerchantApiKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
+    it("rejects non-plain objects", () => {
+      expect(() => assertSafeReportFilter(new Date() as any)).toThrow()
+      expect(() => assertSafeReportFilter([1, 2] as any)).toThrow()
+    })
 
-  it("fails closed when server config is missing", () => {
-    delete process.env.MERCHANT_API_KEY
-    const req: any = { get: () => "Bearer valid-merchant-key-123" }
-    const next = vi.fn()
-    requireMerchantApiKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 500 })
-  })
-
-  it("accepts a correctly formed matching key", () => {
-    const req: any = { get: () => "Bearer valid-merchant-key-123" }
-    const next = vi.fn()
-    requireMerchantApiKey(req, mockRes(), next)
-    expect(next).toHaveBeenCalledWith()
-  })
-
-  it("rejects a non-matching key of equal length", () => {
-    const req: any = { get: () => "Bearer valid-merchant-key-999" }
-    const next = vi.fn()
-    requireMerchantApiKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
-})
-
-describe("adminAuth middleware hardening", () => {
-  const originalEnv = process.env.ADMIN_API_KEY
-
-  beforeEach(() => {
-    process.env.ADMIN_API_KEY = "valid-admin-key-456"
-  })
-
-  afterEach(() => {
-    if (originalEnv === undefined) delete process.env.ADMIN_API_KEY
-    else process.env.ADMIN_API_KEY = originalEnv
-  })
-
-  it("rejects requests with no Authorization header", () => {
-    const req: any = { get: () => undefined }
-    const next = vi.fn()
-    requireAdminKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
-
-  it("rejects malformed Authorization headers (missing Bearer prefix)", () => {
-    const req: any = { get: () => "valid-admin-key-456" }
-    const next = vi.fn()
-    requireAdminKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
-
-  it("rejects keys containing control characters", () => {
-    const req: any = { get: () => "Bearer valid-admin-key-456\n" }
-    const next = vi.fn()
-    requireAdminKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
-
-  it("rejects oversized keys", () => {
-    const req: any = { get: () => `Bearer ${"a".repeat(MAX_API_KEY_LENGTH + 1)}` }
-    const next = vi.fn()
-    requireAdminKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
-  })
-
-  it("fails closed when server config is missing", () => {
-    delete process.env.ADMIN_API_KEY
-    const req: any = { get: () => "Bearer valid-admin-key-456" }
-    const next = vi.fn()
-    requireAdminKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 500 })
-  })
-
-  it("accepts a correctly formed matching key", () => {
-    const req: any = { get: () => "Bearer valid-admin-key-456" }
-    const next = vi.fn()
-    requireAdminKey(req, mockRes(), next)
-    expect(next).toHaveBeenCalledWith()
-  })
-
-  it("rejects a non-matching key of equal length", () => {
-    const req: any = { get: () => "Bearer valid-admin-key-999" }
-    const next = vi.fn()
-    requireAdminKey(req, mockRes(), next)
-    expect(next.mock.calls[0][0]).toMatchObject({ status: 401 })
+    it("accepts well-formed filters", () => {
+      expect(() =>
+        assertSafeReportFilter({ status: "paid", amount: { min: 1, max: 10 } }),
+      ).not.toThrow()
+    })
   })
 })

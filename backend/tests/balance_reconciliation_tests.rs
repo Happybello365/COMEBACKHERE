@@ -366,3 +366,214 @@ fn test_special_characters_in_valid_ids() {
     assert!(BalanceReconciliation::validate_merchant_id("merchant/path").is_err());
     assert!(BalanceReconciliation::validate_merchant_id("merchant\\path").is_err());
 }
+
+#[test]
+fn test_empty_and_whitespace_ids_rejected() {
+    // Empty identifiers must be rejected defensively
+    assert!(BalanceReconciliation::validate_merchant_id("").is_err());
+    assert!(BalanceReconciliation::validate_invoice_id("").is_err());
+
+    // Whitespace-only identifiers must be rejected
+    assert!(BalanceReconciliation::validate_merchant_id("   ").is_err());
+    assert!(BalanceReconciliation::validate_invoice_id("\t\n").is_err());
+
+    // Embedded whitespace is not part of the allowed character set
+    assert!(BalanceReconciliation::validate_merchant_id("merchant 1").is_err());
+    assert!(BalanceReconciliation::validate_invoice_id("invoice 1").is_err());
+}
+
+#[test]
+fn test_unicode_and_control_characters_rejected() {
+    // Non-ASCII / unicode identifiers must be rejected
+    assert!(BalanceReconciliation::validate_merchant_id("merchant-\u{00e9}").is_err());
+    assert!(BalanceReconciliation::validate_invoice_id("invoice-\u{4e2d}\u{6587}").is_err());
+
+    // Control characters must be rejected
+    assert!(BalanceReconciliation::validate_merchant_id("merchant\n1").is_err());
+    assert!(BalanceReconciliation::validate_invoice_id("invoice\r1").is_err());
+    assert!(BalanceReconciliation::validate_merchant_id("merchant\x07").is_err());
+}
+
+#[test]
+fn test_operations_on_unknown_report_id() {
+    let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+
+    // Adding a discrepancy to a non-existent report must fail gracefully
+    let result = reconciliation.add_discrepancy(
+        "does-not-exist",
+        "invoice-1".to_string(),
+        "merchant-1".to_string(),
+        1000,
+        950,
+    );
+    assert!(result.is_err());
+
+    // Completing a non-existent report must fail gracefully
+    assert!(reconciliation
+        .complete_reconciliation("does-not-exist")
+        .is_err());
+
+    // Failing a non-existent report must fail gracefully
+    assert!(reconciliation
+        .fail_reconciliation("does-not-exist", "boom".to_string())
+        .is_err());
+
+    // Fetching a non-existent report must fail gracefully
+    assert!(reconciliation.get_report("does-not-exist").is_err());
+}
+
+#[test]
+fn test_complete_twice_is_rejected() {
+    let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+
+    let report_id = reconciliation
+        .start_reconciliation("api-key", 12345)
+        .unwrap();
+
+    assert!(reconciliation.complete_reconciliation(&report_id).is_ok());
+
+    // Completing an already-completed report must not panic or corrupt state
+    assert!(reconciliation.complete_reconciliation(&report_id).is_err());
+
+    // The report should still be readable and in Completed state
+    let report = reconciliation.get_report(&report_id).unwrap();
+    assert_eq!(report.status, ReconciliationStatus::Completed);
+}
+
+#[test]
+fn test_high_load_concurrent_discrepancies() {
+    let reconciliation = Arc::new(BalanceReconciliation::new(ReconciliationConfig {
+        max_discrepancies_reported: 1000,
+        ..Default::default()
+    }));
+
+    let report_id = reconciliation
+        .start_reconciliation("api-key", 12345)
+        .unwrap();
+
+    let mut handles = vec![];
+    for i in 0..50 {
+        let recon = Arc::clone(&reconciliation);
+        let rid = report_id.clone();
+        let handle = thread::spawn(move || {
+            for j in 0..20 {
+                let _ = recon.add_discrepancy(
+                    &rid,
+                    format!("invoice-{}-{}", i, j),
+                    format!("merchant-{}", i),
+                    1000,
+                    900,
+                );
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        // No thread should panic under concurrent load
+        assert!(handle.join().is_ok());
+    }
+
+    // The report must remain readable and consistent after high load
+    let report = reconciliation.get_report(&report_id).unwrap();
+    assert_eq!(report.status, ReconciliationStatus::Running);
+    assert!(report.discrepancy_count > 0);
+    assert!(report.discrepancies.len() <= 1000);
+}
+
+#[test]
+fn test_high_load_concurrent_balance_updates() {
+    let reconciliation = Arc::new(BalanceReconciliation::new(ReconciliationConfig::default()));
+
+    let mut handles = vec![];
+    for i in 0..20 {
+        let recon = Arc::clone(&reconciliation);
+        let handle = thread::spawn(move || {
+            for j in 0..50 {
+                let key = format!("invoice-{}-merchant-{}", i, j);
+                assert!(recon.set_indexed_balance(key.clone(), (i * 100 + j) as i64).is_ok());
+                let _ = recon.get_indexed_balance(&key);
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        assert!(handle.join().is_ok());
+    }
+
+    // Spot-check that stored values are retrievable and consistent
+    let balance = reconciliation
+        .get_indexed_balance("invoice-0-merchant-0")
+        .unwrap();
+    assert_eq!(balance, Some(0));
+}
+
+#[test]
+fn test_high_load_concurrent_starts_and_completions() {
+    let reconciliation = Arc::new(BalanceReconciliation::new(ReconciliationConfig::default()));
+
+    let mut handles = vec![];
+    for i in 0..20 {
+        let recon = Arc::clone(&reconciliation);
+        let handle = thread::spawn(move || {
+            match recon.start_reconciliation(&format!("api-key-{}", i), 1000 + i as u32) {
+                Ok(id) => {
+                    // Only the winner should be able to complete it
+                    let _ = recon.complete_reconciliation(&id);
+                    true
+                }
+                Err(_) => false,
+            }
+        });
+        handles.push(handle);
+    }
+
+    let mut successful = 0;
+    for handle in handles {
+        if handle.join().unwrap() {
+            successful += 1;
+        }
+    }
+
+    // At most one reconciliation can be started at a time
+    assert!(successful <= 1);
+}
+
+#[test]
+fn test_authorization_edge_cases() {
+    let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+
+    // Whitespace-only authorization must be rejected
+    assert!(reconciliation.verify_authorization("          ").is_err());
+
+    // Control characters must be rejected
+    assert!(reconciliation.verify_authorization("valid-api-key\x00-1234567890").is_err());
+
+    // Extremely long authorization must not panic
+    let long_key = "a".repeat(10_000);
+    let _ = reconciliation.verify_authorization(&long_key);
+}
+
+#[test]
+fn test_extreme_balance_values() {
+    let reconciliation = BalanceReconciliation::new(ReconciliationConfig::default());
+
+    let report_id = reconciliation
+        .start_reconciliation("api-key", 12345)
+        .unwrap();
+
+    // Extreme values must not panic and must compute a difference without overflow
+    assert!(reconciliation
+        .add_discrepancy(
+            &report_id,
+            "invoice-1".to_string(),
+            "merchant-1".to_string(),
+            i64::MAX,
+            i64::MIN,
+        )
+        .is_ok());
+
+    let report = reconciliation.get_report(&report_id).unwrap();
+    assert_eq!(report.discrepancy_count, 1);
+}

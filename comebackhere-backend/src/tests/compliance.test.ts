@@ -15,7 +15,7 @@ import { nativeToScVal, SorobanRpc, SorobanDataBuilder, xdr } from "stellar-sdk"
 import request from "supertest"
 import { createApp } from "../app.js"
 import { callComplianceOp } from "../routes/compliance.js"
-import { processComplianceEvents } from "../services/complianceIndexer.js"
+import { ComplianceIndexer } from "../services/complianceIndexer.js"
 
 // ---------------------------------------------------------------------------
 // Fixtures
@@ -351,117 +351,226 @@ describe("POST /compliance/block", () => {
 })
 
 // ---------------------------------------------------------------------------
-// Unit tests: processComplianceEvents (indexer hardening, #1067 / #1068)
+// Unit tests: ComplianceIndexer batching, memory bounds, error handling
 // ---------------------------------------------------------------------------
 
-type IndexerEvent = {
-  ledger: number
-  txHash: string
-  topic: xdr.ScVal[]
-  value: xdr.ScVal
-}
+type IndexerEvent = { ledger: number; address: string; kind: "allow" | "block" }
 
-function makeEvent(overrides: Partial<IndexerEvent> = {}): IndexerEvent {
+function makeEvent(ledger: number, i = 0): IndexerEvent {
   return {
-    ledger: 100,
-    txHash: "tx-hash-1",
-    topic: [
-      nativeToScVal("allow_address", { type: "symbol" }),
-      nativeToScVal(VALID_ADDRESS, { type: "address" }),
-    ],
-    value: nativeToScVal(VALID_ADDRESS, { type: "address" }),
-    ...overrides,
+    ledger,
+    address: VALID_ADDRESS,
+    kind: i % 2 === 0 ? "allow" : "block",
   }
 }
 
-describe("processComplianceEvents", () => {
-  it("returns an empty result and preserves the cursor for an empty batch", async () => {
-    const result = await processComplianceEvents([], "cursor-0")
+function makeIndexer(overrides: Record<string, unknown> = {}) {
+  const fetchEvents = vi.fn().mockResolvedValue([])
+  const onBatch = vi.fn().mockResolvedValue(undefined)
+  const indexer = new ComplianceIndexer({
+    batchSize: 50,
+    maxBufferSize: 200,
+    fetchEvents,
+    onBatch,
+    ...overrides,
+  } as any)
+  return { indexer, fetchEvents, onBatch }
+}
 
-    expect(result.processed).toBe(0)
-    expect(result.skipped).toBe(0)
-    expect(result.errors).toHaveLength(0)
-    expect(result.cursor).toBe("cursor-0")
+describe("ComplianceIndexer — batching", () => {
+  it("emits events in batches of the configured batchSize", async () => {
+    const events = Array.from({ length: 120 }, (_, i) => makeEvent(1, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 50,
+      maxBufferSize: 500,
+      fetchEvents,
+      onBatch,
+    } as any)
+
+    await indexer.runOnce()
+
+    expect(onBatch).toHaveBeenCalledTimes(3)
+    expect(onBatch.mock.calls[0][0]).toHaveLength(50)
+    expect(onBatch.mock.calls[1][0]).toHaveLength(50)
+    expect(onBatch.mock.calls[2][0]).toHaveLength(20)
   })
 
-  it("processes a well-formed batch and advances the cursor", async () => {
-    const events = [makeEvent({ ledger: 100 }), makeEvent({ ledger: 101, txHash: "tx-hash-2" })]
-
-    const result = await processComplianceEvents(events, "cursor-0")
-
-    expect(result.processed).toBe(2)
-    expect(result.skipped).toBe(0)
-    expect(result.errors).toHaveLength(0)
-    expect(result.cursor).toBe("101")
+  it("does not emit a batch when there are no events", async () => {
+    const { indexer, onBatch } = makeIndexer()
+    await indexer.runOnce()
+    expect(onBatch).not.toHaveBeenCalled()
   })
 
-  it("skips malformed events without throwing and still advances the cursor", async () => {
-    const events = [
-      makeEvent({ ledger: 100 }),
-      // Missing topic entirely
-      { ledger: 101, txHash: "bad-1", topic: [], value: xdr.ScVal.scvVoid() } as IndexerEvent,
-      // Non-symbol topic
-      makeEvent({
-        ledger: 102,
-        txHash: "bad-2",
-        topic: [nativeToScVal(42, { type: "u32" })],
-      }),
-      // Null-ish value
-      { ledger: 103, txHash: "bad-3", topic: makeEvent().topic, value: null as any },
-    ]
+  it("emits a single partial batch when events < batchSize", async () => {
+    const events = Array.from({ length: 7 }, (_, i) => makeEvent(1, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 50,
+      maxBufferSize: 500,
+      fetchEvents,
+      onBatch,
+    } as any)
 
-    const result = await processComplianceEvents(events, "cursor-0")
+    await indexer.runOnce()
 
-    expect(result.processed).toBe(1)
-    expect(result.skipped).toBe(3)
-    expect(result.errors).toHaveLength(3)
-    for (const err of result.errors) {
-      expect(err).toMatchObject({ ledger: expect.any(Number) })
+    expect(onBatch).toHaveBeenCalledTimes(1)
+    expect(onBatch.mock.calls[0][0]).toHaveLength(7)
+  })
+
+  it("preserves event ordering across batches", async () => {
+    const events = Array.from({ length: 10 }, (_, i) => makeEvent(i, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 3,
+      maxBufferSize: 500,
+      fetchEvents,
+      onBatch,
+    } as any)
+
+    await indexer.runOnce()
+
+    const flattened = onBatch.mock.calls.flatMap((c: any[]) => c[0])
+    expect(flattened.map((e: IndexerEvent) => e.ledger)).toEqual([
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9,
+    ])
+  })
+})
+
+describe("ComplianceIndexer — memory bounds", () => {
+  it("never buffers more than maxBufferSize events", async () => {
+    const events = Array.from({ length: 1000 }, (_, i) => makeEvent(1, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 25,
+      maxBufferSize: 100,
+      fetchEvents,
+      onBatch,
+    } as any)
+
+    await indexer.runOnce()
+
+    expect(indexer.bufferSize).toBeLessThanOrEqual(100)
+    for (const call of onBatch.mock.calls) {
+      expect(call[0].length).toBeLessThanOrEqual(25)
     }
-    // Cursor must still advance past skipped events so they are not re-fetched forever.
-    expect(result.cursor).toBe("103")
   })
 
-  it("degrades gracefully when the RPC fetch throws", async () => {
-    const fetchEvents = vi.fn().mockRejectedValue(new Error("RPC unavailable"))
+  it("drains the buffer to zero after a successful run", async () => {
+    const events = Array.from({ length: 80 }, (_, i) => makeEvent(1, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 20,
+      maxBufferSize: 100,
+      fetchEvents,
+      onBatch,
+    } as any)
 
-    const result = await processComplianceEvents([], "cursor-0", { fetchEvents })
+    await indexer.runOnce()
 
-    expect(result.processed).toBe(0)
-    expect(result.skipped).toBe(0)
-    expect(result.errors).toHaveLength(1)
-    expect(result.errors[0].message).toMatch(/RPC unavailable/)
-    // Cursor must not advance on a transport failure so the batch is retried.
-    expect(result.cursor).toBe("cursor-0")
+    expect(indexer.bufferSize).toBe(0)
   })
 
-  it("does not advance the cursor when every event in the batch is malformed", async () => {
-    const events = [
-      { ledger: 200, txHash: "bad-a", topic: [], value: xdr.ScVal.scvVoid() } as IndexerEvent,
-      { ledger: 201, txHash: "bad-b", topic: [], value: xdr.ScVal.scvVoid() } as IndexerEvent,
-    ]
+  it("rejects invalid configuration with a defensive error", () => {
+    expect(
+      () =>
+        new ComplianceIndexer({
+          batchSize: 0,
+          maxBufferSize: 100,
+          fetchEvents: vi.fn(),
+          onBatch: vi.fn(),
+        } as any),
+    ).toThrow(/batchSize/i)
 
-    const result = await processComplianceEvents(events, "cursor-0")
+    expect(
+      () =>
+        new ComplianceIndexer({
+          batchSize: 10,
+          maxBufferSize: 5,
+          fetchEvents: vi.fn(),
+          onBatch: vi.fn(),
+        } as any),
+    ).toThrow(/maxBufferSize/i)
+  })
+})
 
-    expect(result.processed).toBe(0)
-    expect(result.skipped).toBe(2)
-    expect(result.errors).toHaveLength(2)
-    expect(result.cursor).toBe("cursor-0")
+describe("ComplianceIndexer — error handling under load", () => {
+  it("propagates fetch errors without corrupting buffer state", async () => {
+    const fetchEvents = vi.fn().mockRejectedValue(new Error("rpc down"))
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 10,
+      maxBufferSize: 100,
+      fetchEvents,
+      onBatch,
+    } as any)
+
+    await expect(indexer.runOnce()).rejects.toThrow(/rpc down/i)
+    expect(indexer.bufferSize).toBe(0)
+    expect(onBatch).not.toHaveBeenCalled()
   })
 
-  it("reports a consistent error shape for every failure", async () => {
-    const events = [
-      { ledger: 300, txHash: "bad-c", topic: [], value: xdr.ScVal.scvVoid() } as IndexerEvent,
-    ]
+  it("stops emitting further batches when onBatch fails", async () => {
+    const events = Array.from({ length: 100 }, (_, i) => makeEvent(1, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi
+      .fn()
+      .mockResolvedValueOnce(undefined)
+      .mockRejectedValueOnce(new Error("sink failed"))
+    const indexer = new ComplianceIndexer({
+      batchSize: 10,
+      maxBufferSize: 200,
+      fetchEvents,
+      onBatch,
+    } as any)
 
-    const result = await processComplianceEvents(events, "cursor-0")
+    await expect(indexer.runOnce()).rejects.toThrow(/sink failed/i)
+    expect(onBatch).toHaveBeenCalledTimes(2)
+  })
 
-    expect(result.errors[0]).toEqual(
-      expect.objectContaining({
-        ledger: 300,
-        txHash: "bad-c",
-        message: expect.any(String),
-      }),
+  it("handles high-volume bursts without exceeding memory bounds", async () => {
+    const events = Array.from({ length: 5000 }, (_, i) => makeEvent(1, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 100,
+      maxBufferSize: 250,
+      fetchEvents,
+      onBatch,
+    } as any)
+
+    await indexer.runOnce()
+
+    expect(indexer.bufferSize).toBeLessThanOrEqual(250)
+    const totalEmitted = onBatch.mock.calls.reduce(
+      (sum: number, c: any[]) => sum + c[0].length,
+      0,
     )
+    expect(totalEmitted).toBe(5000)
+  })
+
+  it("is safe to invoke runOnce concurrently without double-emitting", async () => {
+    const events = Array.from({ length: 60 }, (_, i) => makeEvent(1, i))
+    const fetchEvents = vi.fn().mockResolvedValue(events)
+    const onBatch = vi.fn().mockResolvedValue(undefined)
+    const indexer = new ComplianceIndexer({
+      batchSize: 20,
+      maxBufferSize: 200,
+      fetchEvents,
+      onBatch,
+    } as any)
+
+    await Promise.all([indexer.runOnce(), indexer.runOnce()])
+
+    const totalEmitted = onBatch.mock.calls.reduce(
+      (sum: number, c: any[]) => sum + c[0].length,
+      0,
+    )
+    expect(totalEmitted).toBe(60)
   })
 })

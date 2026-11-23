@@ -132,25 +132,33 @@ impl FeeDistributor {
     }
 
     /// Calculate fees for a given gross amount.
-    pub fn calculate_fees(&self, gross_amount: u64) -> Result<FeeCalculation, FeeDistributorError> {
+    pub fn calculate_fees(&self, gross_amount:u64) -> Result<FeeCalculation, FeeDistributorError> {
         // Validate input
         if gross_amount == 0 {
             return Err(FeeDistributorError::ZeroAmount);
         }
 
-        // Calculate fee based on percentage
-        let fee_from_percentage = gross_amount
-            .checked_mul(self.config.fee_percentage_ppt as u64)
+        // Validate the configured fee percentage before using it, so a
+        // misconfigured distributor fails fast instead of producing
+        // inconsistent results under load.
+        Self::validate_fee_percentage(self.config.fee_percentage_ppt)?;
+
+        // Calculate fee based on percentage using checked arithmetic.
+        // Use u128 intermediate to avoid overflow for large gross amounts.
+        let fee_from_percentage = (gross_amount as u128)
+            .checked_mul(self.config.fee_percentage_ppt as u128)
             .and_then(|f| f.checked_div(1000))
+            .and_then(|f| u64::try_from(f).ok())
             .ok_or(FeeDistributorError::AmountOverflow)?;
 
         // Apply minimum fee threshold
         let fee_amount = fee_from_percentage.max(self.config.min_fee_stroops);
 
-        // Calculate net amount
+        // Calculate net amount with checked subtraction. If the minimum fee
+        // exceeds the gross amount, reject rather than underflow.
         let net_amount = gross_amount
             .checked_sub(fee_amount)
-            .ok_or(FeeDistributorError::AmountOverflow)?;
+            .ok_or(FeeDistributorError::FeeExceedsGross)?;
 
         let calculation = FeeCalculation {
             gross_amount,
@@ -209,6 +217,22 @@ impl FeeDistributor {
         merchant: String,
         amount: u64,
     ) -> Result<FeeDistribution, FeeDistributorError> {
+        // Validate inputs defensively before touching shared state.
+        if id.is_empty() {
+            return Err(FeeDistributorError::Internal(
+                "distribution id cannot be empty".to_string(),
+            ));
+        }
+        if merchant.is_empty() {
+            return Err(FeeDistributorError::Internal(
+                "merchant cannot be empty".to_string(),
+            ));
+        }
+
+        // Calculate fees up front so invalid amounts never consume queue
+        // capacity or concurrency slots.
+        let calculation = self.calculate_fees(amount)?;
+
         // Check concurrency limits
         let active = self
             .active_count
@@ -227,8 +251,13 @@ impl FeeDistributor {
             return Err(FeeDistributorError::QueueSaturated);
         }
 
-        // Calculate fees
-        let calculation = self.calculate_fees(amount)?;
+        // Reject duplicate ids to keep status tracking unambiguous.
+        if distributions.iter().any(|d| d.id == id) {
+            return Err(FeeDistributorError::Internal(format!(
+                "distribution {} already exists",
+                id
+            )));
+        }
 
         let distribution = FeeDistribution {
             id,
@@ -240,6 +269,8 @@ impl FeeDistributor {
         };
 
         distributions.push(distribution.clone());
+        self.active_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         Ok(distribution)
     }
 
@@ -251,9 +282,16 @@ impl FeeDistributor {
             .map_err(|_| FeeDistributorError::Internal("lock poisoned".to_string()))?;
 
         if let Some(dist) = distributions.iter_mut().find(|d| d.id == id) {
-            dist.status = DistributionStatus::Completed;
-            self.active_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // Only decrement the active counter for distributions that were
+            // actually in-flight; repeated transitions must not underflow.
+            if matches!(
+                dist.status,
+                DistributionStatus::Pending | DistributionStatus::Processing
+            ) {
+                dist.status = DistributionStatus::Completed;
+                dist.error = None;
+                self.decrement_active();
+            }
             Ok(())
         } else {
             Err(FeeDistributorError::Internal(format!(
@@ -271,10 +309,16 @@ impl FeeDistributor {
             .map_err(|_| FeeDistributorError::Internal("lock poisoned".to_string()))?;
 
         if let Some(dist) = distributions.iter_mut().find(|d| d.id == id) {
-            dist.status = DistributionStatus::Failed;
-            dist.error = Some(error);
-            self.active_count
-                .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            // Only decrement the active counter for distributions that were
+            // actually in-flight; repeated transitions must not underflow.
+            if matches!(
+                dist.status,
+                DistributionStatus::Pending | DistributionStatus::Processing
+            ) {
+                dist.status = DistributionStatus::Failed;
+                dist.error = Some(error);
+                self.decrement_active();
+            }
             Ok(())
         } else {
             Err(FeeDistributorError::Internal(format!(
@@ -282,6 +326,15 @@ impl FeeDistributor {
                 id
             )))
         }
+    }
+
+    /// Safely decrement the active counter without underflowing.
+    fn decrement_active(&self) {
+        let _ = self.active_count.fetch_update(
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+            |current| current.checked_sub(1),
+        );
     }
 
     /// Get the status of a distribution.
@@ -422,5 +475,112 @@ mod tests {
             distributor.get_status("dist-1").unwrap(),
             DistributionStatus::Failed
         );
+    }
+
+    #[test]
+    fn test_calculate_fees_min_fee_exceeds_gross() {
+        let config = FeeDistributorConfig {
+            min_fee_stroops: 10_000,
+            ..Default::default()
+        };
+        let distributor = FeeDistributor::new(config);
+        // Gross below the minimum fee must not underflow.
+        assert!(matches!(
+            distributor.calculate_fees(500),
+            Err(FeeDistributorError::FeeExceedsGross)
+        ));
+    }
+
+    #[test]
+    fn test_calculate_fees_invalid_config_percentage() {
+        let config = FeeDistributorConfig {
+            fee_percentage_ppt: 100_001,
+            ..Default::default()
+        };
+        let distributor = FeeDistributor::new(config);
+        assert!(matches!(
+            distributor.calculate_fees(100_000),
+            Err(FeeDistributorError::InvalidFeePercentage(_))
+        ));
+    }
+
+    #[test]
+    fn test_calculate_fees_large_amount_no_overflow() {
+        let distributor = FeeDistributor::new(FeeDistributorConfig::default());
+        // Large but valid amount should compute without overflow.
+        let result = distributor.calculate_fees(u64::MAX / 2).unwrap();
+        assert_eq!(result.gross_amount, result.net_amount + result.fee_amount);
+    }
+
+    #[test]
+    fn test_queue_distribution_rejects_empty_inputs() {
+        let distributor = FeeDistributor::new(FeeDistributorConfig::default());
+        assert!(distributor
+            .queue_distribution(String::new(), "merchant-1".to_string(), 100_000)
+            .is_err());
+        assert!(distributor
+            .queue_distribution("dist-1".to_string(), String::new(), 100_000)
+            .is_err());
+        assert_eq!(distributor.queue_depth().unwrap(), 0);
+    }
+
+    #[test]
+    fn test_queue_distribution_rejects_duplicate_id() {
+        let distributor = FeeDistributor::new(FeeDistributorConfig::default());
+        assert!(distributor
+            .queue_distribution("dist-1".to_string(), "merchant-1".to_string(), 100_000)
+            .is_ok());
+        assert!(distributor
+            .queue_distribution("dist-1".to_string(), "merchant-1".to_string(), 100_000)
+            .is_err());
+    }
+
+    #[test]
+    fn test_invalid_amount_does_not_consume_queue() {
+        let distributor = FeeDistributor::new(FeeDistributorConfig::default());
+        assert!(distributor
+            .queue_distribution("dist-1".to_string(), "merchant-1".to_string(), 0)
+            .is_err());
+        assert_eq!(distributor.queue_depth().unwrap(), 0);
+        assert_eq!(distributor.active_count(), 0);
+    }
+
+    #[test]
+    fn test_active_count_tracks_lifecycle() {
+        let distributor = FeeDistributor::new(FeeDistributorConfig::default());
+        distributor
+            .queue_distribution("dist-1".to_string(), "merchant-1".to_string(), 100_000)
+            .unwrap();
+        assert_eq!(distributor.active_count(), 1);
+        distributor.mark_completed("dist-1").unwrap();
+        assert_eq!(distributor.active_count(), 0);
+    }
+
+    #[test]
+    fn test_repeated_completion_does_not_underflow() {
+        let distributor = FeeDistributor::new(FeeDistributorConfig::default());
+        distributor
+            .queue_distribution("dist-1".to_string(), "merchant-1".to_string(), 100_000)
+            .unwrap();
+        distributor.mark_completed("dist-1").unwrap();
+        // Second completion must be a no-op and not underflow the counter.
+        assert!(distributor.mark_completed("dist-1").is_ok());
+        assert_eq!(distributor.active_count(), 0);
+    }
+
+    #[test]
+    fn test_concurrency_limit_enforced() {
+        let config = FeeDistributorConfig {
+            max_concurrent_distributions: 1,
+            ..Default::default()
+        };
+        let distributor = FeeDistributor::new(config);
+        assert!(distributor
+            .queue_distribution("dist-1".to_string(), "merchant-1".to_string(), 100_000)
+            .is_ok());
+        assert!(matches!(
+            distributor.queue_distribution("dist-2".to_string(), "merchant-1".to_string(), 100_000),
+            Err(FeeDistributorError::ConcurrencyLimitExceeded)
+        ));
     }
 }

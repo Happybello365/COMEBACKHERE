@@ -252,3 +252,134 @@ fn test_fee_calculation_validation() {
 
     assert!(invalid.validate().is_err());
 }
+
+#[test]
+fn test_high_load_edge_amounts_no_panic() {
+    let distributor = FeeDistributor::new(FeeDistributorConfig {
+        fee_percentage_ppt: 50,
+        min_fee_stroops: 100,
+        ..Default::default()
+    });
+
+    // Boundary and near-boundary amounts must never panic; they either
+    // produce a valid calculation or a well-defined error.
+    let amounts = [
+        0,
+        1,
+        2,
+        999,
+        1000,
+        1001,
+        u64::MAX / 2,
+        u64::MAX - 1,
+        u64::MAX,
+    ];
+
+    for amount in amounts {
+        match distributor.calculate_fees(amount) {
+            Ok(calc) => {
+                assert_eq!(
+                    calc.gross_amount,
+                    calc.net_amount + calc.fee_amount,
+                    "invariant broken for amount {}",
+                    amount
+                );
+                assert!(calc.fee_amount <= calc.gross_amount);
+                assert!(calc.validate().is_ok());
+            }
+            Err(FeeDistributorError::ZeroAmount) => {
+                assert_eq!(amount, 0, "ZeroAmount only expected for zero input");
+            }
+            Err(FeeDistributorError::AmountOverflow) => {
+                // Acceptable defensive error for extreme inputs.
+            }
+            Err(other) => panic!("unexpected error for amount {}: {:?}", amount, other),
+        }
+    }
+}
+
+#[test]
+fn test_high_load_queue_never_exceeds_capacity() {
+    use std::sync::Arc;
+    use std::thread;
+
+    let max_queue_depth = 64;
+    let distributor = Arc::new(FeeDistributor::new(FeeDistributorConfig {
+        max_concurrent_distributions: 32,
+        max_queue_depth,
+        ..Default::default()
+    }));
+
+    let mut handles = vec![];
+    for i in 0..16 {
+        let dist = Arc::clone(&distributor);
+        let handle = thread::spawn(move || {
+            for j in 0..32 {
+                let result = dist.queue_distribution(
+                    format!("dist-{}-{}", i, j),
+                    format!("merchant-{}", i % 4),
+                    100_000 + (j as u64) * 1000,
+                );
+                // Either accepted or rejected with a defined error; never panic.
+                match result {
+                    Ok(_) => {}
+                    Err(FeeDistributorError::QueueSaturated) => {}
+                    Err(other) => panic!("unexpected queue error: {:?}", other),
+                }
+            }
+        });
+        handles.push(handle);
+    }
+
+    for handle in handles {
+        handle.join().expect("worker thread must not panic");
+    }
+
+    let depth = distributor.queue_depth().unwrap();
+    assert!(
+        depth <= max_queue_depth,
+        "queue depth {} exceeded capacity {}",
+        depth,
+        max_queue_depth
+    );
+}
+
+#[test]
+fn test_duplicate_distribution_id_handling() {
+    let distributor = FeeDistributor::new(FeeDistributorConfig::default());
+
+    assert!(distributor
+        .queue_distribution("dup-1".to_string(), "merchant-1".to_string(), 100_000)
+        .is_ok());
+
+    // Re-queueing the same id must not panic and must not corrupt state.
+    let second = distributor.queue_distribution(
+        "dup-1".to_string(),
+        "merchant-1".to_string(),
+        100_000,
+    );
+    match second {
+        Ok(_) | Err(_) => {}
+    }
+
+    // Status lookups for unknown ids must return a defined error, not panic.
+    assert!(distributor.get_status("does-not-exist").is_err());
+    assert!(distributor.mark_completed("does-not-exist").is_err());
+    assert!(distributor
+        .mark_failed("does-not-exist", "boom".to_string())
+        .is_err());
+}
+
+#[test]
+fn test_invalid_config_rejected() {
+    // Fee percentage above the allowed maximum must be rejected defensively.
+    let config = FeeDistributorConfig {
+        fee_percentage_ppt: 100_001,
+        ..Default::default()
+    };
+    let distributor = FeeDistributor::new(config);
+    assert!(matches!(
+        distributor.calculate_fees(100_000),
+        Err(FeeDistributorError::InvalidConfig) | Err(FeeDistributorError::InvalidFeePercentage)
+    ));
+}

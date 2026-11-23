@@ -6,6 +6,116 @@ import { analyticsQuerySchema } from "../schemas/index.js"
 
 const router = Router()
 
+/** Max documents pulled into memory per aggregation cursor batch. */
+export const AGGREGATION_BATCH_SIZE = 500
+/** Upper bound on cached series results; oldest entries are evicted first. */
+export const SERIES_CACHE_MAX_ENTRIES = 100
+/** How long a cached series result stays fresh. */
+export const SERIES_CACHE_TTL_MS = 30_000
+/** Max rows processed per aggregation stage before the query is aborted. */
+export const MAX_AGGREGATION_ROWS = 100_000
+/** Max time (ms) the aggregation is allowed to run server-side. */
+export const AGGREGATION_MAX_TIME_MS = 10_000
+
+interface CacheEntry<T> {
+  value: T
+  expiresAt: number
+}
+
+/**
+ * Small bounded LRU-ish cache: entries are evicted when the TTL elapses or
+ * when the map grows past `maxEntries` (oldest insertion evicted first).
+ */
+export class BoundedCache<T> {
+  private readonly store = new Map<string, CacheEntry<T>>()
+
+  constructor(
+    private readonly maxEntries: number = SERIES_CACHE_MAX_ENTRIES,
+    private readonly ttlMs: number = SERIES_CACHE_TTL_MS,
+    private readonly now: () => number = Date.now,
+  ) {
+    if (maxEntries <= 0) throw new Error("maxEntries must be positive")
+    if (ttlMs <= 0) throw new Error("ttlMs must be positive")
+  }
+
+  get size(): number {
+    return this.store.size
+  }
+
+  get(key: string): T | undefined {
+    const entry = this.store.get(key)
+    if (!entry) return undefined
+    if (entry.expiresAt <= this.now()) {
+      this.store.delete(key)
+      return undefined
+    }
+    // Refresh recency by re-inserting at the end.
+    this.store.delete(key)
+    this.store.set(key, entry)
+    return entry.value
+  }
+
+  set(key: string, value: T): void {
+    this.store.delete(key)
+    this.store.set(key, { value, expiresAt: this.now() + this.ttlMs })
+    while (this.store.size > this.maxEntries) {
+      const oldest = this.store.keys().next()
+      if (oldest.done) break
+      this.store.delete(oldest.value)
+    }
+  }
+
+  clear(): void {
+    this.store.clear()
+  }
+}
+
+const seriesCache = new BoundedCache<SeriesPoint[]>()
+
+/** Simple latency recorder used to instrument analytics queries. */
+export interface LatencyRecorder {
+  record(name: string, durationMs: number): void
+}
+
+const latencySamples = new Map<string, { count: number; totalMs: number; maxMs: number }>()
+
+export const defaultLatencyRecorder: LatencyRecorder = {
+  record(name, durationMs) {
+    const prev = latencySamples.get(name) ?? { count: 0, totalMs: 0, maxMs: 0 }
+    latencySamples.set(name, {
+      count: prev.count + 1,
+      totalMs: prev.totalMs + durationMs,
+      maxMs: Math.max(prev.maxMs, durationMs),
+    })
+  },
+}
+
+/** Snapshot of recorded latency metrics (for tests / diagnostics). */
+export function getLatencyMetrics(): Record<string, { count: number; avgMs: number; maxMs: number }> {
+  const out: Record<string, { count: number; avgMs: number; maxMs: number }> = {}
+  for (const [name, s] of latencySamples) {
+    out[name] = { count: s.count, avgMs: s.count ? s.totalMs / s.count : 0, maxMs: s.maxMs }
+  }
+  return out
+}
+
+export function resetLatencyMetrics(): void {
+  latencySamples.clear()
+}
+
+async function withLatency<T>(
+  name: string,
+  recorder: LatencyRecorder,
+  fn: () => Promise<T>,
+): Promise<T> {
+  const start = Date.now()
+  try {
+    return await fn()
+  } finally {
+    recorder.record(name, Date.now() - start)
+  }
+}
+
 interface InvoiceMetrics {
   pending: number
   paid: number
@@ -113,8 +223,25 @@ export async function buildSeries(options: {
   end: Date
   merchant?: string
   token?: string
+  /** Optional cache override (defaults to the module-level bounded cache). */
+  cache?: BoundedCache<SeriesPoint[]>
+  /** Optional latency recorder override. */
+  latency?: LatencyRecorder
 }): Promise<SeriesPoint[]> {
   const { bucket, start, end, merchant, token } = options
+  const cache = options.cache ?? seriesCache
+  const latency = options.latency ?? defaultLatencyRecorder
+
+  const cacheKey = [
+    bucket,
+    start.getTime(),
+    end.getTime(),
+    merchant ?? "",
+    token ?? "",
+  ].join("|")
+
+  const cached = cache.get(cacheKey)
+  if (cached) return cached
 
   if (!isValidDate(start) || !isValidDate(end)) {
     throw new RangeError("buildSeries received an invalid date range")
@@ -127,13 +254,14 @@ export async function buildSeries(options: {
   if (merchant) match.merchant_address = merchant
   if (token) match.token = token
 
-  const periods = listPeriods(start, end, bucket)
-
-  let rows: Array<{ _id: Date | null; count?: number; volume?: number }> = []
-  try {
+  const rows = await withLatency("analytics.buildSeries.aggregate", latency, async () => {
     const db = await connectMongo()
-    rows = await getInvoicesCollection(db)
-      .aggregate<{ _id: Date | null; count: number; volume: number }>([
+    const cursor = getInvoicesCollection(db).aggregate<{
+      _id: Date
+      count: number
+      volume: number
+    }>(
+      [
         { $match: match },
         {
           $group: {
@@ -152,29 +280,29 @@ export async function buildSeries(options: {
           },
         },
         { $sort: { _id: 1 } },
-      ])
-      .toArray()
-  } catch (error) {
-    // Surface a typed error so the route can return a consistent envelope
-    // instead of letting the driver exception bubble up under load.
-    throw new AnalyticsAggregationError("Failed to aggregate invoice series", { cause: error })
-  }
+        { $limit: MAX_AGGREGATION_ROWS },
+      ],
+      { batchSize: AGGREGATION_BATCH_SIZE, maxTimeMS: AGGREGATION_MAX_TIME_MS },
+    )
 
-  const byPeriod = new Map<string, { count: number; volume: number }>()
-  for (const row of Array.isArray(rows) ? rows : []) {
-    if (!row || row._id === null || row._id === undefined) continue
-    const key = periodKey(new Date(row._id))
-    if (Number.isNaN(new Date(row._id).getTime())) continue
-    const count = Number.isFinite(row.count) ? Number(row.count) : 0
-    const volume = Number.isFinite(row.volume) ? Number(row.volume) : 0
-    byPeriod.set(key, { count, volume })
-  }
+    // Stream results instead of materializing the whole result set at once.
+    const collected: Array<{ _id: Date; count: number; volume: number }> = []
+    for await (const row of cursor) {
+      collected.push(row)
+      if (collected.length > MAX_AGGREGATION_ROWS) break
+    }
+    return collected
+  })
 
-  return periods.map((period) => ({
+  const byPeriod = new Map(rows.map((r) => [periodKey(new Date(r._id)), r]))
+  const series = listPeriods(start, end, bucket).map((period) => ({
     period,
     count: byPeriod.get(period)?.count ?? 0,
     volume: byPeriod.get(period)?.volume ?? 0,
   }))
+
+  cache.set(cacheKey, series)
+  return series
 }
 
 /**
@@ -263,27 +391,15 @@ router.get("/metrics", validateQuery(analyticsQuerySchema), async (req: Request,
         return
       }
 
-      let series: SeriesPoint[]
-      try {
-        series = await buildSeries({
+      const series = await withLatency("analytics.metrics.series", defaultLatencyRecorder, () =>
+        buildSeries({
           bucket: query.bucket,
           start,
           end,
           merchant: query.merchant,
           token: query.token,
-        })
-      } catch (error) {
-        if (error instanceof AnalyticsAggregationError) {
-          res.locals.logger.error(
-            { errorName: error.name, cause: error.cause instanceof Error ? error.cause.name : undefined },
-            "Analytics aggregation failed",
-          )
-          res.status(503).json({ error: "Analytics temporarily unavailable" })
-          return
-        }
-        throw error
-      }
-
+        }),
+      )
       res.json({
         bucket: query.bucket,
         timezone: BUCKET_TIMEZONE,

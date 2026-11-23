@@ -53,6 +53,57 @@ export const webhookDeadLetterVolume = new Gauge({
   registers: [metricsRegistry],
 })
 
+export const reportingDbQueryDuration = new Histogram({
+  name: "reporting_db_query_duration_seconds",
+  help: "Duration of reporting-engine database queries in seconds",
+  labelNames: ["operation", "status"],
+  buckets: [0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2.5, 5],
+  registers: [metricsRegistry],
+})
+
+export const reportingDbQueryTotal = new Counter({
+  name: "reporting_db_query_total",
+  help: "Total reporting-engine database queries by outcome",
+  labelNames: ["operation", "status"],
+  registers: [metricsRegistry],
+})
+
+export const reportingDbRowsReturned = new Histogram({
+  name: "reporting_db_rows_returned",
+  help: "Number of rows returned per reporting-engine database query",
+  labelNames: ["operation"],
+  buckets: [0, 1, 10, 100, 500, 1000, 5000, 10000, 50000],
+  registers: [metricsRegistry],
+})
+
+export const reportingCacheOperations = new Counter({
+  name: "reporting_cache_operations_total",
+  help: "Reporting-engine cache operations by result",
+  labelNames: ["operation", "result"],
+  registers: [metricsRegistry],
+})
+
+export const reportingCacheOperationDuration = new Histogram({
+  name: "reporting_cache_operation_duration_seconds",
+  help: "Duration of reporting-engine cache operations in seconds",
+  labelNames: ["operation"],
+  buckets: [0.0001, 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1],
+  registers: [metricsRegistry],
+})
+
+export const reportingCacheEntries = new Gauge({
+  name: "reporting_cache_entries",
+  help: "Number of entries currently held in the reporting-engine cache",
+  registers: [metricsRegistry],
+})
+
+export const reportingCacheEvictions = new Counter({
+  name: "reporting_cache_evictions_total",
+  help: "Number of reporting-engine cache entries evicted",
+  labelNames: ["reason"],
+  registers: [metricsRegistry],
+})
+
 const retentionLabels = ["indexer"] as const
 
 export function counter(name: string, help: string) {

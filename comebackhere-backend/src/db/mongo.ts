@@ -178,6 +178,16 @@ export function ensureIndexes(database: Db): Promise<void> {
     { collection: "invoices", keys: { status: 1, merchant_address: 1 } },
     { collection: "invoices", keys: { created_at: -1 } },
     { collection: "invoices", keys: { created_at: -1, invoice_id: -1 } },
+    // Reporting-engine: covering indexes for aggregate/group-by queries.
+    { collection: "invoices", keys: { status: 1, created_at: -1 } },
+    { collection: "invoices", keys: { merchant_address: 1, created_at: -1 } },
+    { collection: "invoices", keys: { token: 1, status: 1 } },
+    { collection: "settlements", keys: { merchant_address: 1, updated_at: -1 } },
+    { collection: "settlements", keys: { status: 1, updated_at: -1 } },
+    { collection: "settlements", keys: { token: 1, status: 1 } },
+    { collection: "compliance_audit", keys: { address: 1, event_type: 1, ledger: -1 } },
+    { collection: "compliance_audit", keys: { status: 1, ledger: -1 } },
+    { collection: "compliance_audit", keys: { created_at: -1 } },
     { collection: "indexer_cursors", keys: { _id: 1 }, unique: true },
     { collection: "invoice_events", keys: { event_id: 1 }, unique: true },
     { collection: "invoice_events", keys: { invoice_id: 1, ledger: 1 } },
@@ -217,17 +227,30 @@ export function ensureIndexes(database: Db): Promise<void> {
 // unreachable MongoDB fails fast instead of hanging indefinitely.
 // 
 // Tuned for production load:
-// - maxPoolSize increased from 10 to 25 to handle API+indexer concurrent load
-// - minPoolSize increased from 2 to 5 for faster recovery after spike
+// - maxPoolSize increased from 10 to 50 to handle API+indexer+reporting
+//   concurrent load under peak traffic.
+// - minPoolSize increased from 2 to 10 for faster recovery after spike
+// - maxIdleTimeMS bounds idle connection lifetime so the pool shrinks back
+//   after peak load instead of holding sockets open indefinitely.
 // - socketTimeoutMS increased to 60s (was 45s) to accommodate Soroban RPC
 //   timeouts (30s max per call). Prevents cascade failures when Soroban is slow.
 // ---------------------------------------------------------------------------
 
 const MONGO_OPTIONS = {
   /** Maximum number of connections in the pool. Increased for concurrent load. */
-  maxPoolSize: 25,
+  maxPoolSize: 50,
   /** Minimum number of idle connections to maintain. Faster recovery after spikes. */
-  minPoolSize: 5,
+  minPoolSize: 10,
+  /**
+   * How long (ms) an idle connection may remain in the pool before being
+   * closed. Keeps the pool from holding excess sockets after peak load.
+   */
+  maxIdleTimeMS: 60_000,
+  /**
+   * How long (ms) a connection may be checked out of the pool before the
+   * driver logs a warning. Helps surface slow reporting queries.
+   */
+  waitQueueTimeoutMS: 15_000,
   /**
    * How long (ms) the driver will wait when selecting a server before
    * throwing a MongoServerSelectionError.  Default is 30 000; we tighten

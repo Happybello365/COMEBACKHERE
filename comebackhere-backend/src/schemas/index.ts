@@ -244,27 +244,44 @@ export const complianceAuditQuerySchema = z.object({
   message: "from_ledger must be before to_ledger",
 })
 
+const MAX_TIMESTAMP_SECONDS = 253_402_300_799 // 9999-12-31T23:59:59Z
+const MAX_TOKEN_LEN_BYTES = 128
+
+const timestampQueryParam = z
+  .string()
+  .max(20, "Invalid timestamp")
+  .regex(/^\d+$/, "Invalid timestamp")
+  .transform((val) => Number(val))
+  .pipe(
+    z
+      .number()
+      .int("Invalid timestamp")
+      .nonnegative("Invalid timestamp")
+      .max(MAX_TIMESTAMP_SECONDS, "Invalid timestamp"),
+  )
+  .optional()
+
 export const analyticsQuerySchema = z
   .object({
-    start_date: z
-      .string()
-      .optional()
-      .transform((val) => (val ? parseInt(val, 10) : undefined))
-      .pipe(z.number().finite("Invalid start_date timestamp").optional()),
-    end_date: z
-      .string()
-      .optional()
-      .transform((val) => (val ? parseInt(val, 10) : undefined))
-      .pipe(z.number().finite("Invalid end_date timestamp").optional()),
+    start_date: timestampQueryParam,
+    end_date: timestampQueryParam,
     bucket: z
       .enum(["day", "week", "month"], { message: "bucket must be one of: day, week, month" })
       .optional(),
     merchant: stellarAddress.optional(),
-    token: z.string().min(1).optional(),
+    token: z
+      .string()
+      .min(1)
+      .refine(
+        (val) => Buffer.byteLength(val, "utf8") <= MAX_TOKEN_LEN_BYTES,
+        `token must not exceed ${MAX_TOKEN_LEN_BYTES} bytes`,
+      )
+      .optional(),
   })
+  .strict()
   .refine(
     (data) => {
-      if (data.start_date && data.end_date) {
+      if (data.start_date !== undefined && data.end_date !== undefined) {
         return data.start_date <= data.end_date
       }
       return true

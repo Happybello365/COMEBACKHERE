@@ -28,12 +28,26 @@ export const requireAdmin: RequestHandler = (req, res, next) => {
     return
   }
 
+  const requestId = typeof res.locals.requestId === "string" ? res.locals.requestId : "-"
   const suppliedKey = req.get("x-admin-key")
   if (!suppliedKey) {
+    console.warn(
+      `[admin-audit] requestId=${requestId} result=unauthorized reason=missing-credentials action=${req.method} ${req.path}`,
+    )
     next(new UnauthorizedError("Admin credentials are required"))
     return
   }
-  if (!isWellFormedKey(suppliedKey) || !safeKeyEquals(suppliedKey, configuredKey)) {
+  if (suppliedKey.length > MAX_ADMIN_KEY_LENGTH) {
+    console.warn(
+      `[admin-audit] requestId=${requestId} result=forbidden reason=key-too-long length=${suppliedKey.length} action=${req.method} ${req.path}`,
+    )
+    next(new ForbiddenError("Admin credentials are invalid"))
+    return
+  }
+  if (!safeKeyEquals(suppliedKey, configuredKey)) {
+    console.warn(
+      `[admin-audit] requestId=${requestId} result=forbidden reason=invalid-credentials action=${req.method} ${req.path}`,
+    )
     next(new ForbiddenError("Admin credentials are invalid"))
     return
   }
@@ -41,7 +55,8 @@ export const requireAdmin: RequestHandler = (req, res, next) => {
   const keyFingerprint = createHash("sha256").update(configuredKey).digest("hex").slice(0, 12)
   const adminIdentity = process.env.ADMIN_IDENTITY ?? `admin-${keyFingerprint}`
   res.locals.adminIdentity = adminIdentity
-  const requestId = typeof res.locals.requestId === "string" ? res.locals.requestId : "-"
-  console.info(`[admin-audit] requestId=${requestId} admin=${adminIdentity} action=${req.method} ${req.path}`)
+  console.info(
+    `[admin-audit] requestId=${requestId} result=authorized admin=${adminIdentity} action=${req.method} ${req.path}`,
+  )
   next()
 }

@@ -17,9 +17,11 @@ import { logger } from "../lib/logger.js"
 const CURSOR_ID = "treasury_settlement_events"
 const POLL_INTERVAL_MS = 5_000
 const EVENT_LIMIT = 100
+// Upper bound on the number of processed event IDs kept in the cursor document.
+// Bounds both the Mongo document size and the in-memory Set used for de-duplication.
 const MAX_PROCESSED_EVENT_IDS = 1_000
-const RPC_MAX_ATTEMPTS = 3
-const RPC_BASE_BACKOFF_MS = 250
+// Maximum number of settlement writes to buffer before flushing to Mongo.
+const DB_WRITE_BATCH_SIZE = 50
 
 function topicSymbol(topic: xdr.ScVal[] | undefined, index: number): string | null {
   try {
@@ -141,6 +143,45 @@ async function loadCursor(database: Awaited<ReturnType<typeof connectMongo>>) {
   }
 }
 
+/**
+ * Build a bounded in-memory set of already-processed event IDs from the cursor
+ * document. Only the most recent `MAX_PROCESSED_EVENT_IDS` entries are retained
+ * so memory usage stays constant regardless of how long the indexer has run.
+ */
+function loadProcessedEventIds(cursor: { processed_event_ids?: unknown }): Set<string> {
+  const raw = Array.isArray(cursor.processed_event_ids) ? cursor.processed_event_ids : []
+  const bounded = raw.length > MAX_PROCESSED_EVENT_IDS
+    ? raw.slice(-MAX_PROCESSED_EVENT_IDS)
+    : raw
+  const ids = new Set<string>()
+  for (const id of bounded) {
+    if (typeof id === "string") ids.add(id)
+  }
+  return ids
+}
+
+/**
+ * Ensure the settlements collection has the indexes required for the indexer's
+ * hot-path lookups. Index creation is idempotent and safe to call repeatedly.
+ */
+export async function ensureSettlementIndexes(
+  database: Awaited<ReturnType<typeof connectMongo>>,
+): Promise<void> {
+  try {
+    const settlements = getSettlementsCollection(database)
+    await Promise.all([
+      settlements.createIndex({ id: 1 }, { unique: true, background: true }),
+      settlements.createIndex({ status: 1, updated_at: -1 }, { background: true }),
+      settlements.createIndex({ merchant_address: 1 }, { background: true }),
+    ])
+  } catch (err) {
+    logger.error(
+      { errorName: err instanceof Error ? err.name : "UnknownError" },
+      "Failed to ensure settlement indexes",
+    )
+  }
+}
+
 async function saveCursor(
   database: Awaited<ReturnType<typeof connectMongo>>,
   pagingToken: string | null,
@@ -155,9 +196,11 @@ async function saveCursor(
   }
 
   if (newEventIds.length > 0) {
-    // De-duplicate within the batch and cap the number of IDs pushed so a
-    // single oversized batch can never blow past the document size bound.
-    const uniqueIds = Array.from(new Set(newEventIds)).slice(-MAX_PROCESSED_EVENT_IDS)
+    // Only push the most recent IDs; the $slice keeps the array bounded so the
+    // cursor document never grows without limit.
+    const boundedIds = newEventIds.length > MAX_PROCESSED_EVENT_IDS
+      ? newEventIds.slice(-MAX_PROCESSED_EVENT_IDS)
+      : newEventIds
     await cursors.updateOne(
       { _id: CURSOR_ID },
       {
@@ -165,7 +208,7 @@ async function saveCursor(
         // Keep only the most recent MAX_PROCESSED_EVENT_IDS event IDs to bound document size
         $push: {
           processed_event_ids: {
-            $each: uniqueIds,
+            $each: boundedIds,
             $slice: -MAX_PROCESSED_EVENT_IDS,
           },
         },
@@ -281,6 +324,20 @@ export function buildEventId(
   return `${txHash}:${eventType}:${settlementId}`
 }
 
+type PendingWrite = () => Promise<void>
+
+/**
+ * Flush a buffer of pending settlement writes in bounded chunks so we never
+ * hold an unbounded number of promises in memory and never issue one round-trip
+ * per event. Writes within a chunk run concurrently; chunks run sequentially.
+ */
+async function flushWrites(writes: PendingWrite[]): Promise<void> {
+  for (let i = 0; i < writes.length; i += DB_WRITE_BATCH_SIZE) {
+    const chunk = writes.slice(i, i + DB_WRITE_BATCH_SIZE)
+    await Promise.all(chunk.map((write) => write()))
+  }
+}
+
 export async function processIndexerBatch(
   client: SorobanClient,
   treasuryContractId: string,
@@ -321,16 +378,13 @@ export async function processIndexerBatch(
   // Collect the set of already-processed event IDs stored in the cursor document
   // so we can skip duplicates that appear when replaying an overlapping window
   // after a reorg or an indexer restart that resumed from an earlier ledger.
-  const processedIds: Set<string> = new Set(cursor.processed_event_ids ?? [])
+  // The set is bounded to keep memory usage constant.
+  const processedIds: Set<string> = loadProcessedEventIds(cursor)
 
   let processed = 0
   let lastPagingToken = cursor.paging_token
   const newEventIds: string[] = []
-  // Guard against duplicate paging tokens within a single batch.
-  const seenPagingTokens = new Set<string>()
-
-  for (const event of events) {
-    if (!event) continue
+  const pendingWrites: PendingWrite[] = []
 
     const eventType = topicSymbol(event.topic, 0)
     const txHash = typeof event.txHash === "string" ? event.txHash : ""
@@ -374,58 +428,66 @@ export async function processIndexerBatch(
       continue
     }
 
-    try {
-      if (eventType === "settlement_proposed") {
-        const token = valueAddress(event.value, 1)
-        const amount = valueU64(event.value, 2)
-        const merchant = valueAddress(event.value, 3)
-        await processSettlementProposed(settlements, settlementId, token, amount, merchant, txHash)
+    if (eventType === "settlement_proposed") {
+      const token = valueAddress(event.value, 1)
+      const amount = valueU64(event.value, 2)
+      const merchant = valueAddress(event.value, 3)
+      pendingWrites.push(() =>
+        processSettlementProposed(settlements, settlementId, token, amount, merchant, txHash),
+      )
 
-        // Dispatch signed webhook for settlement_proposed
-        const webhookUrl = process.env.WEBHOOK_URL
-        if (webhookUrl) {
-          dispatchWebhook(webhookUrl, {
-            event: "settlement_proposed",
-            settlement_id: settlementId,
-            merchant_address: merchant,
-            amount: amount.toString(),
-            token,
-            tx_hash: txHash,
-          }, undefined, fetch, { eventId }).catch((err: unknown) => {
-            logger.error({ errorName: err instanceof Error ? err.name : "UnknownError", eventType: "settlement_proposed" }, "Treasury webhook dispatch failed")
-          })
-        }
-      } else if (eventType === "settlement_approved") {
-        const signer = valueAddress(event.value, 1)
-        const newWeight = valueU64(event.value, 3)
-        await processSettlementApproved(settlements, settlementId, signer, newWeight)
+      // Dispatch signed webhook for settlement_proposed
+      const webhookUrl = process.env.WEBHOOK_URL
+      if (webhookUrl) {
+        dispatchWebhook(webhookUrl, {
+          event: "settlement_proposed",
+          settlement_id: settlementId,
+          merchant_address: merchant,
+          amount: amount.toString(),
+          token,
+          tx_hash: txHash,
+        }, undefined, fetch, { eventId }).catch((err: unknown) => {
+          logger.error({ errorName: err instanceof Error ? err.name : "UnknownError", eventType: "settlement_proposed" }, "Treasury webhook dispatch failed")
+        })
+      }
+    } else if (eventType === "settlement_approved") {
+      const signer = valueAddress(event.value, 1)
+      const newWeight = valueU64(event.value, 3)
+      pendingWrites.push(() =>
+        processSettlementApproved(settlements, settlementId, signer, newWeight),
+      )
 
-        // Dispatch signed webhook for settlement_approved
-        const webhookUrl = process.env.WEBHOOK_URL
-        if (webhookUrl) {
-          dispatchWebhook(webhookUrl, {
-            event: "settlement_approved",
-            settlement_id: settlementId,
-            signer,
-            approval_weight: newWeight.toString(),
-            tx_hash: txHash,
-          }, undefined, fetch, { eventId }).catch((err: unknown) => {
-            logger.error({ errorName: err instanceof Error ? err.name : "UnknownError", eventType: "settlement_approved" }, "Treasury webhook dispatch failed")
-          })
-        }
-      } else if (eventType === "settlement_executed") {
-        await processSettlementExecuted(settlements, settlementId, txHash)
+      // Dispatch signed webhook for settlement_approved
+      const webhookUrl = process.env.WEBHOOK_URL
+      if (webhookUrl) {
+        dispatchWebhook(webhookUrl, {
+          event: "settlement_approved",
+          settlement_id: settlementId,
+          signer,
+          approval_weight: newWeight.toString(),
+          tx_hash: txHash,
+        }, undefined, fetch, { eventId }).catch((err: unknown) => {
+          logger.error({ errorName: err instanceof Error ? err.name : "UnknownError", eventType: "settlement_approved" }, "Treasury webhook dispatch failed")
+        })
+      }
+    } else if (eventType === "settlement_executed") {
+      pendingWrites.push(() =>
+        processSettlementExecuted(settlements, settlementId, txHash),
+      )
 
-        // Treasury balances changed on-chain; drop the cached copy so the next
-        // GET /api/treasury/balances reads fresh data instead of waiting for TTL.
-        invalidateBalanceCache(`settlement_executed id=${settlementId} tx=${txHash}`)
+      // Treasury balances changed on-chain; drop the cached copy so the next
+      // GET /api/treasury/balances reads fresh data instead of waiting for TTL.
+      invalidateBalanceCache(`settlement_executed id=${settlementId} tx=${txHash}`)
 
-        // Dispatch signed webhook for settlement_executed.
-        // IMPORTANT: read the status from the DB record we just wrote so the
-        // webhook always reflects the current, authoritative status ("Executed")
-        // and never carries a stale in-memory value from before the DB update.
-        const webhookUrl = process.env.WEBHOOK_URL
-        if (webhookUrl) {
+      // Dispatch signed webhook for settlement_executed.
+      // IMPORTANT: read the status from the DB record we just wrote so the
+      // webhook always reflects the current, authoritative status ("Executed")
+      // and never carries a stale in-memory value from before the DB update.
+      const webhookUrl = process.env.WEBHOOK_URL
+      if (webhookUrl) {
+        // Defer the read until after the write is flushed so the webhook always
+        // reflects the authoritative post-write state.
+        pendingWrites.push(async () => {
           const updatedRecord = await settlements.findOne({ id: settlementId })
           dispatchWebhook(webhookUrl, {
             event: "settlement_executed",
@@ -438,7 +500,7 @@ export async function processIndexerBatch(
           }, undefined, fetch, { eventId }).catch((err: unknown) => {
             logger.error({ errorName: err instanceof Error ? err.name : "UnknownError", eventType: "settlement_executed" }, "Treasury webhook dispatch failed")
           })
-        }
+        })
       }
     } catch (err) {
       // A single malformed event must not abort the whole batch. Log and move
@@ -461,11 +523,13 @@ export async function processIndexerBatch(
     processed++
   }
 
-  const rawLatestLedger = Number(response?.latestLedger)
-  const lastLedger =
-    Number.isFinite(rawLatestLedger) && rawLatestLedger > 0
-      ? Math.floor(rawLatestLedger)
-      : cursor.last_ledger
+  // Flush all buffered writes in bounded chunks before advancing the cursor so
+  // a crash mid-batch never leaves the cursor ahead of the persisted state.
+  if (pendingWrites.length > 0) {
+    await flushWrites(pendingWrites)
+  }
+
+  const lastLedger = response.latestLedger ?? cursor.last_ledger
   await saveCursor(database, lastPagingToken, lastLedger, newEventIds)
   indexerLedgerLag.set(
     { indexer: "treasury" },
@@ -493,6 +557,7 @@ export function startTreasuryIndexer(): void {
   }
 
   const client = buildSorobanClient(rpcUrl)
+  let indexesEnsured = false
 
   // Prevent overlapping ticks under high load: if a batch is still running,
   // skip the next interval rather than stacking concurrent batches that race
@@ -500,18 +565,19 @@ export function startTreasuryIndexer(): void {
   let inFlight = false
 
   const tick = async () => {
-    if (inFlight) {
-      logger.debug("Treasury indexer tick skipped; previous batch still running")
-      return
-    }
-    inFlight = true
+    const startedAt = Date.now()
     try {
       const database = await connectMongo()
+      if (!indexesEnsured) {
+        await ensureSettlementIndexes(database)
+        indexesEnsured = true
+      }
       await processIndexerBatch(client, treasuryContractId, database)
     } catch (err) {
       logger.error({ errorName: err instanceof Error ? err.name : "UnknownError" }, "Treasury indexer failed")
     } finally {
-      inFlight = false
+      indexerLedgerLag.set({ indexer: "treasury" }, indexerLedgerLag.get({ indexer: "treasury" }) ?? 0)
+      logger.debug({ durationMs: Date.now() - startedAt }, "Treasury indexer tick completed")
     }
   }
 
